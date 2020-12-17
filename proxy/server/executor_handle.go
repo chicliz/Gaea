@@ -313,7 +313,7 @@ func (se *SessionExecutor) handleSetVariable(v *ast.VariableAssignment) error {
 	}
 }
 
-func (se *SessionExecutor) handleSetAutoCommit(autocommit bool) error {
+func (se *SessionExecutor) handleSetAutoCommit(autocommit bool) (err error) {
 	se.txLock.Lock()
 	defer se.txLock.Unlock()
 
@@ -324,18 +324,16 @@ func (se *SessionExecutor) handleSetAutoCommit(autocommit bool) error {
 		}
 		for _, pc := range se.txConns {
 			if e := pc.SetAutoCommit(1); e != nil {
-				pc.Recycle()
-				se.txConns = make(map[string]backend.PooledConnect)
-				return fmt.Errorf("set autocommit error, %v", e)
+				err = fmt.Errorf("set autocommit error, %v", e)
 			}
 			pc.Recycle()
 		}
 		se.txConns = make(map[string]backend.PooledConnect)
-		return nil
+		return
 	}
 
 	se.status &= ^mysql.ServerStatusAutocommit
-	return nil
+	return
 }
 
 func (se *SessionExecutor) handleStmtPrepare(sql string) (*Stmt, error) {
