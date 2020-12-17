@@ -16,6 +16,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"runtime"
@@ -73,6 +74,19 @@ func (se *SessionExecutor) handleQuery(sql string) (r *mysql.Result, err error) 
 	startTime := time.Now()
 	stmtType := parser.Preview(sql)
 	reqCtx.Set(util.StmtType, stmtType)
+
+	// init select limit ctx
+	maxSelectResultSet := se.manager.GetNamespace(se.namespace).maxSelectResultSet
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if se.manager.GetNamespace(se.namespace).maxSqlExecuteTime <= 0 {
+		ctx, cancel = context.WithCancel(context.Background()) // 未开启sql执行超时限制
+	} else {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(se.manager.GetNamespace(se.namespace).maxSqlExecuteTime)*time.Millisecond)
+	}
+	ctx = context.WithValue(ctx, "maxSelectResultSet", maxSelectResultSet)
+	reqCtx.Set("ctx", ctx)
+	reqCtx.Set("cancel", cancel)
 
 	r, err = se.doQuery(reqCtx, sql)
 	se.manager.RecordSessionSQLMetrics(reqCtx, se, sql, startTime, err)
@@ -299,7 +313,7 @@ func (se *SessionExecutor) handleSetVariable(v *ast.VariableAssignment) error {
 	}
 }
 
-func (se *SessionExecutor) handleSetAutoCommit(autocommit bool) (err error) {
+func (se *SessionExecutor) handleSetAutoCommit(autocommit bool) error {
 	se.txLock.Lock()
 	defer se.txLock.Unlock()
 
@@ -310,16 +324,18 @@ func (se *SessionExecutor) handleSetAutoCommit(autocommit bool) (err error) {
 		}
 		for _, pc := range se.txConns {
 			if e := pc.SetAutoCommit(1); e != nil {
-				err = fmt.Errorf("set autocommit error, %v", e)
+				pc.Recycle()
+				se.txConns = make(map[string]backend.PooledConnect)
+				return fmt.Errorf("set autocommit error, %v", e)
 			}
 			pc.Recycle()
 		}
 		se.txConns = make(map[string]backend.PooledConnect)
-		return
+		return nil
 	}
 
 	se.status &= ^mysql.ServerStatusAutocommit
-	return
+	return nil
 }
 
 func (se *SessionExecutor) handleStmtPrepare(sql string) (*Stmt, error) {

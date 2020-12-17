@@ -18,6 +18,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
+
+	"github.com/XiaoMi/Gaea/core/errors"
 
 	"github.com/XiaoMi/Gaea/backend"
 	"github.com/XiaoMi/Gaea/backend/mocks"
@@ -31,6 +34,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gopkg.in/ini.v1"
 )
+
+var se = prepareSessionExecutor()
 
 func TestGetVariableExprResult(t *testing.T) {
 	tests := []struct {
@@ -62,12 +67,7 @@ func TestGetVariableExprResult(t *testing.T) {
 	}
 }
 
-func TestExecute(t *testing.T) {
-	se, err := prepareSessionExecutor()
-	if err != nil {
-		t.Fatal("prepare session executer error:", err)
-		return
-	}
+func Test_ExecuteWithCtx_Success(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 
@@ -80,8 +80,40 @@ func TestExecute(t *testing.T) {
 	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Master = slice1MasterPool
 	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Slave = []backend.ConnectionPool{slice1SlavePool}
 
-	expectResult1 := &mysql.Result{}
-	expectResult2 := &mysql.Result{}
+	rowData := make([]mysql.RowData, 0)
+	expectResult1 := &mysql.Result{
+		Status:       1,
+		InsertID:     1,
+		AffectedRows: 1,
+		Resultset: &mysql.Resultset{
+			Fields:     nil,
+			FieldNames: nil,
+			Values:     nil,
+			RowDatas:   rowData,
+		},
+	}
+	expectResult2 := &mysql.Result{
+		Status:       1,
+		InsertID:     1,
+		AffectedRows: 1,
+		Resultset: &mysql.Resultset{
+			Fields:     nil,
+			FieldNames: nil,
+			Values:     nil,
+			RowDatas:   rowData,
+		},
+	}
+
+	maxSelectResultSet := se.manager.GetNamespace(se.namespace).maxSelectResultSet
+	var ctxL context.Context
+	var cancel context.CancelFunc
+	if se.manager.GetNamespace(se.namespace).maxSqlExecuteTime <= 0 {
+		ctxL, cancel = context.WithCancel(context.Background()) // 未开启sql执行超时限制
+	} else {
+		ctxL, cancel = context.WithTimeout(context.Background(), time.Duration(se.manager.GetNamespace(se.namespace).maxSqlExecuteTime)*time.Millisecond)
+	}
+	ctxL = context.WithValue(ctxL, "maxSelectResultSet", maxSelectResultSet)
+
 	//slice-0
 	ctx := context.Background()
 	slice0MasterConn := new(mocks.PooledConnect)
@@ -90,7 +122,7 @@ func TestExecute(t *testing.T) {
 	slice0MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
 	slice0MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
 	slice0MasterConn.On("GetAddr").Return("127.0.0.1:3306")
-	slice0MasterConn.On("Execute", "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult1, nil)
+	slice0MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult1, nil)
 	slice0MasterConn.On("Recycle").Return(nil)
 
 	//slice-1
@@ -100,7 +132,7 @@ func TestExecute(t *testing.T) {
 	slice1MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
 	slice1MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
 	slice1MasterConn.On("GetAddr").Return("127.0.0.1:3306")
-	slice1MasterConn.On("Execute", "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult2, nil)
+	slice1MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult2, nil)
 	slice1MasterConn.On("Recycle").Return(nil)
 
 	sqls := map[string]map[string][]string{
@@ -118,19 +150,353 @@ func TestExecute(t *testing.T) {
 	reqCtx := util.NewRequestContext()
 	reqCtx.Set(util.StmtType, parser.StmtInsert)
 
-	rs, err := se.ExecuteSQLs(reqCtx, sqls)
-	assert.Equal(t, nil, err)
-	assert.Equal(t, rs, ret)
+	reqCtx.Set("ctx", ctxL)
+	reqCtx.Set("cancel", cancel)
+
+	rs, _ := se.ExecuteSQLs(reqCtx, sqls)
+	assert.Equal(t, ret, rs)
 }
 
-func prepareSessionExecutor() (*SessionExecutor, error) {
+func Test_ExecuteWithCtx_One_Slice_Execute_TimeOut(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	slice0MasterPool := new(mocks.ConnectionPool)
+	slice0SlavePool := new(mocks.ConnectionPool)
+	slice1MasterPool := new(mocks.ConnectionPool)
+	slice1SlavePool := new(mocks.ConnectionPool)
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-0"].Master = slice0MasterPool
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-0"].Slave = []backend.ConnectionPool{slice0SlavePool}
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Master = slice1MasterPool
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Slave = []backend.ConnectionPool{slice1SlavePool}
+
+	rowData := make([]mysql.RowData, 0)
+	expectResult2 := &mysql.Result{
+		Status:       1,
+		InsertID:     1,
+		AffectedRows: 1,
+		Resultset: &mysql.Resultset{
+			Fields:     nil,
+			FieldNames: nil,
+			Values:     nil,
+			RowDatas:   rowData,
+		},
+	}
+
+	maxSelectResultSet := se.manager.GetNamespace(se.namespace).maxSelectResultSet
+	var ctxL context.Context
+	var cancel context.CancelFunc
+	if se.manager.GetNamespace(se.namespace).maxSqlExecuteTime <= 0 {
+		ctxL, cancel = context.WithCancel(context.Background()) // 未开启sql执行超时限制
+	} else {
+		ctxL, cancel = context.WithTimeout(context.Background(), time.Duration(se.manager.GetNamespace(se.namespace).maxSqlExecuteTime)*time.Millisecond)
+	}
+	ctxL = context.WithValue(ctxL, "maxSelectResultSet", maxSelectResultSet)
+
+	//slice-0
+	ctx := context.Background()
+	slice0MasterConn := new(mocks.PooledConnect)
+	slice0MasterPool.On("Get", ctx).Return(slice0MasterConn, nil).Once()
+	slice0MasterConn.On("UseDB", "db_mycat_0").Return(nil)
+	slice0MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
+	slice0MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
+	slice0MasterConn.On("GetAddr").Return("127.0.0.1:3306")
+	slice0MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").WaitUntil(time.After(time.Second*5)).Return(nil, errors.ErrOutOfMaxTime)
+	slice0MasterConn.On("Recycle").Return(nil).Times(1)
+
+	//slice-1
+	slice1MasterConn := new(mocks.PooledConnect)
+	slice1MasterPool.On("Get", ctx).Return(slice1MasterConn, nil).Once()
+	slice1MasterConn.On("UseDB", "db_mycat_2").Return(nil)
+	slice1MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
+	slice1MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
+	slice1MasterConn.On("GetAddr").Return("127.0.0.1:3306")
+	slice1MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult2, nil)
+	slice1MasterConn.On("Recycle").Return(nil).Times(1)
+
+	sqls := map[string]map[string][]string{
+		"slice-0": {
+			"db_mycat_0": {"SELECT * FROM `tbl_mycat` WHERE `k`=0"},
+		},
+		"slice-1": {
+			"db_mycat_2": {"SELECT * FROM `tbl_mycat` WHERE `k`=0"},
+		},
+	}
+
+	reqCtx := util.NewRequestContext()
+	reqCtx.Set(util.StmtType, parser.StmtInsert)
+
+	reqCtx.Set("ctx", ctxL)
+	reqCtx.Set("cancel", cancel)
+
+	rs, err := se.ExecuteSQLs(reqCtx, sqls)
+	assert.Equal(t, 0, len(rs))
+	assert.Equal(t, errors.ErrOutOfMaxTime, err)
+}
+
+func Test_ExecuteWithCtx_One_Slice_ResultSet_OutOfLimit(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	slice0MasterPool := new(mocks.ConnectionPool)
+	slice0SlavePool := new(mocks.ConnectionPool)
+	slice1MasterPool := new(mocks.ConnectionPool)
+	slice1SlavePool := new(mocks.ConnectionPool)
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-0"].Master = slice0MasterPool
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-0"].Slave = []backend.ConnectionPool{slice0SlavePool}
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Master = slice1MasterPool
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Slave = []backend.ConnectionPool{slice1SlavePool}
+
+	rowData := make([]mysql.RowData, 0)
+	expectResult2 := &mysql.Result{
+		Status:       1,
+		InsertID:     1,
+		AffectedRows: 1,
+		Resultset: &mysql.Resultset{
+			Fields:     nil,
+			FieldNames: nil,
+			Values:     nil,
+			RowDatas:   rowData,
+		},
+	}
+
+	maxSelectResultSet := se.manager.GetNamespace(se.namespace).maxSelectResultSet
+	var ctxL context.Context
+	var cancel context.CancelFunc
+	if se.manager.GetNamespace(se.namespace).maxSqlExecuteTime <= 0 {
+		ctxL, cancel = context.WithCancel(context.Background()) // 未开启sql执行超时限制
+	} else {
+		ctxL, cancel = context.WithTimeout(context.Background(), time.Duration(se.manager.GetNamespace(se.namespace).maxSqlExecuteTime)*time.Millisecond)
+	}
+	ctxL = context.WithValue(ctxL, "maxSelectResultSet", maxSelectResultSet)
+
+	//slice-0
+	ctx := context.Background()
+	slice0MasterConn := new(mocks.PooledConnect)
+	slice0MasterPool.On("Get", ctx).Return(slice0MasterConn, nil).Once()
+	slice0MasterConn.On("UseDB", "db_mycat_0").Return(nil)
+	slice0MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
+	slice0MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
+	slice0MasterConn.On("GetAddr").Return("127.0.0.1:3306")
+	slice0MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(nil, errors.ErrOutOfMaxResultSetLimit)
+	slice0MasterConn.On("Recycle").Return(nil).Times(1)
+
+	//slice-1
+	slice1MasterConn := new(mocks.PooledConnect)
+	slice1MasterPool.On("Get", ctx).Return(slice1MasterConn, nil).Once()
+	slice1MasterConn.On("UseDB", "db_mycat_2").Return(nil)
+	slice1MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
+	slice1MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
+	slice1MasterConn.On("GetAddr").Return("127.0.0.1:3306")
+	slice1MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult2, nil)
+	slice1MasterConn.On("Recycle").Return(nil).Times(1)
+
+	sqls := map[string]map[string][]string{
+		"slice-0": {
+			"db_mycat_0": {"SELECT * FROM `tbl_mycat` WHERE `k`=0"},
+		},
+		"slice-1": {
+			"db_mycat_2": {"SELECT * FROM `tbl_mycat` WHERE `k`=0"},
+		},
+	}
+
+	reqCtx := util.NewRequestContext()
+	reqCtx.Set(util.StmtType, parser.StmtInsert)
+
+	reqCtx.Set("ctx", ctxL)
+	reqCtx.Set("cancel", cancel)
+
+	rs, err := se.ExecuteSQLs(reqCtx, sqls)
+	assert.Equal(t, 0, len(rs))
+	assert.Equal(t, fmt.Errorf("sql of slice execute err:%s", errors.ErrOutOfMaxResultSetLimit.Error()), err)
+}
+
+func Test_ExecuteWithCtx_Slice_ResultSet_Sum_OutOfLimit(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	slice0MasterPool := new(mocks.ConnectionPool)
+	slice0SlavePool := new(mocks.ConnectionPool)
+	slice1MasterPool := new(mocks.ConnectionPool)
+	slice1SlavePool := new(mocks.ConnectionPool)
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-0"].Master = slice0MasterPool
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-0"].Slave = []backend.ConnectionPool{slice0SlavePool}
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Master = slice1MasterPool
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Slave = []backend.ConnectionPool{slice1SlavePool}
+
+	rowData := make([]mysql.RowData, 501) //result总大小配置为1000<501*2
+	expectResult1 := &mysql.Result{
+		Status:       1,
+		InsertID:     1,
+		AffectedRows: 1,
+		Resultset: &mysql.Resultset{
+			Fields:     nil,
+			FieldNames: nil,
+			Values:     nil,
+			RowDatas:   rowData,
+		},
+	}
+	expectResult2 := &mysql.Result{
+		Status:       1,
+		InsertID:     1,
+		AffectedRows: 1,
+		Resultset: &mysql.Resultset{
+			Fields:     nil,
+			FieldNames: nil,
+			Values:     nil,
+			RowDatas:   rowData,
+		},
+	}
+
+	maxSelectResultSet := se.manager.GetNamespace(se.namespace).maxSelectResultSet
+	var ctxL context.Context
+	var cancel context.CancelFunc
+	if se.manager.GetNamespace(se.namespace).maxSqlExecuteTime <= 0 {
+		ctxL, cancel = context.WithCancel(context.Background()) // 未开启sql执行超时限制
+	} else {
+		ctxL, cancel = context.WithTimeout(context.Background(), time.Duration(se.manager.GetNamespace(se.namespace).maxSqlExecuteTime)*time.Millisecond)
+	}
+	ctxL = context.WithValue(ctxL, "maxSelectResultSet", maxSelectResultSet)
+
+	//slice-0
+	ctx := context.Background()
+	slice0MasterConn := new(mocks.PooledConnect)
+	slice0MasterPool.On("Get", ctx).Return(slice0MasterConn, nil).Once()
+	slice0MasterConn.On("UseDB", "db_mycat_0").Return(nil)
+	slice0MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
+	slice0MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
+	slice0MasterConn.On("GetAddr").Return("127.0.0.1:3306")
+	slice0MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult1, nil)
+	slice0MasterConn.On("Recycle").Return(nil).Times(1)
+
+	//slice-1
+	slice1MasterConn := new(mocks.PooledConnect)
+	slice1MasterPool.On("Get", ctx).Return(slice1MasterConn, nil).Once()
+	slice1MasterConn.On("UseDB", "db_mycat_2").Return(nil)
+	slice1MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
+	slice1MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
+	slice1MasterConn.On("GetAddr").Return("127.0.0.1:3306")
+	slice1MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult2, nil)
+	slice1MasterConn.On("Recycle").Return(nil).Times(1)
+
+	sqls := map[string]map[string][]string{
+		"slice-0": {
+			"db_mycat_0": {"SELECT * FROM `tbl_mycat` WHERE `k`=0"},
+		},
+		"slice-1": {
+			"db_mycat_2": {"SELECT * FROM `tbl_mycat` WHERE `k`=0"},
+		},
+	}
+
+	reqCtx := util.NewRequestContext()
+	reqCtx.Set(util.StmtType, parser.StmtInsert)
+
+	reqCtx.Set("ctx", ctxL)
+	reqCtx.Set("cancel", cancel)
+
+	rs, err := se.ExecuteSQLs(reqCtx, sqls)
+	assert.Equal(t, 0, len(rs))
+	assert.Equal(t, errors.ErrOutOfMaxResultSetLimit, err)
+}
+
+//ERROR 1062 (23000): Duplicate entry '1960073974' for key 'PRIMARY'
+func Test_ExecuteWithCtx_One_Slice_Error(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	slice0MasterPool := new(mocks.ConnectionPool)
+	slice0SlavePool := new(mocks.ConnectionPool)
+	slice1MasterPool := new(mocks.ConnectionPool)
+	slice1SlavePool := new(mocks.ConnectionPool)
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-0"].Master = slice0MasterPool
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-0"].Slave = []backend.ConnectionPool{slice0SlavePool}
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Master = slice1MasterPool
+	se.manager.GetNamespace("test_executor_namespace").slices["slice-1"].Slave = []backend.ConnectionPool{slice1SlavePool}
+
+	rowData := make([]mysql.RowData, 501) //result总大小配置为1000<501*2
+	//expectResult1 := &mysql.Result{
+	//	Status:       1,
+	//	InsertID:     1,
+	//	AffectedRows: 1,
+	//	Resultset: &mysql.Resultset{
+	//		Fields:     nil,
+	//		FieldNames: nil,
+	//		Values:     nil,
+	//		RowDatas:   rowData,
+	//	},
+	//}
+	expectResult2 := &mysql.Result{
+		Status:       1,
+		InsertID:     1,
+		AffectedRows: 1,
+		Resultset: &mysql.Resultset{
+			Fields:     nil,
+			FieldNames: nil,
+			Values:     nil,
+			RowDatas:   rowData,
+		},
+	}
+
+	maxSelectResultSet := se.manager.GetNamespace(se.namespace).maxSelectResultSet
+	var ctxL context.Context
+	var cancel context.CancelFunc
+	if se.manager.GetNamespace(se.namespace).maxSqlExecuteTime <= 0 {
+		ctxL, cancel = context.WithCancel(context.Background()) // 未开启sql执行超时限制
+	} else {
+		ctxL, cancel = context.WithTimeout(context.Background(), time.Duration(se.manager.GetNamespace(se.namespace).maxSqlExecuteTime)*time.Millisecond)
+	}
+	ctxL = context.WithValue(ctxL, "maxSelectResultSet", maxSelectResultSet)
+
+	//slice-0
+	ctx := context.Background()
+	slice0MasterConn := new(mocks.PooledConnect)
+	slice0MasterPool.On("Get", ctx).Return(slice0MasterConn, nil).Once()
+	slice0MasterConn.On("UseDB", "db_mycat_0").Return(nil)
+	slice0MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
+	slice0MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
+	slice0MasterConn.On("GetAddr").Return("127.0.0.1:3306")
+	slice0MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(nil, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '1960073974' for key 'PRIMARY'"))
+	slice0MasterConn.On("Recycle").Return(nil).Times(1)
+
+	//slice-1
+	slice1MasterConn := new(mocks.PooledConnect)
+	slice1MasterPool.On("Get", ctx).Return(slice1MasterConn, nil).Once()
+	slice1MasterConn.On("UseDB", "db_mycat_2").Return(nil)
+	slice1MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
+	slice1MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
+	slice1MasterConn.On("GetAddr").Return("127.0.0.1:3306")
+	slice1MasterConn.On("ExecuteWithCtx", ctxL, "SELECT * FROM `tbl_mycat` WHERE `k`=0").WaitUntil(time.After(1*time.Second)).Return(expectResult2, nil)
+	slice1MasterConn.On("Recycle").Return(nil).Times(1)
+
+	sqls := map[string]map[string][]string{
+		"slice-0": {
+			"db_mycat_0": {"SELECT * FROM `tbl_mycat` WHERE `k`=0"},
+		},
+		"slice-1": {
+			"db_mycat_2": {"SELECT * FROM `tbl_mycat` WHERE `k`=0"},
+		},
+	}
+
+	reqCtx := util.NewRequestContext()
+	reqCtx.Set(util.StmtType, parser.StmtInsert)
+
+	reqCtx.Set("ctx", ctxL)
+	reqCtx.Set("cancel", cancel)
+
+	rs, err := se.ExecuteSQLs(reqCtx, sqls)
+	assert.Equal(t, 0, len(rs))
+	assert.Equal(t, fmt.Errorf("sql of slice execute err:%s", "ERROR 1062 (23000): Duplicate entry '1960073974' for key 'PRIMARY'"), err)
+	time.Sleep(3 * time.Second)
+}
+
+func prepareSessionExecutor() *SessionExecutor {
 	var userName = "test_executor"
 	var namespaceName = "test_executor_namespace"
 	var database = "db_ks"
 
 	m, err := prepareNamespaceManager()
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 	executor := newSessionExecutor(m)
 	executor.user = userName
@@ -141,7 +507,7 @@ func prepareSessionExecutor() (*SessionExecutor, error) {
 	// set database
 	executor.SetDatabase(database)
 	executor.namespace = namespaceName
-	return executor, nil
+	return executor
 }
 
 func prepareNamespaceManager() (*Manager, error) {
@@ -258,7 +624,9 @@ encrypt_key=1234abcd5678efg*
             "rw_split": 1
         }
     ],
-    "default_slice": "slice-0"
+    "default_slice": "slice-0",
+    "max_sql_execute_time":3000,
+    "max_select_result_set":1000
 }`
 
 	//加载proxy配置

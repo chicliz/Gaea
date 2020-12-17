@@ -14,6 +14,7 @@ type PooledConnect interface {
 	IsClosed() bool
 	UseDB(db string) error
 	Execute(sql string) (*mysql.Result, error)
+	ExecuteWithCtx(ctx context.Context, sql string) (*mysql.Result, error)
 	SetAutoCommit(v uint8) error
 	Begin() error
 	Commit() error
