@@ -461,16 +461,6 @@ func initBackendConn(pc backend.PooledConnect, phyDB string, charset string, col
 	return nil
 }
 
-type pcInfo struct {
-	sliceName string
-	completed bool //用于标记对应分片连接是否执行完毕成功返回
-	pc        backend.PooledConnect
-}
-
-func (p *pcInfo) setCompleted(completed bool) {
-	p.completed = completed
-}
-
 func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs map[string]backend.PooledConnect,
 	sqls map[string]map[string][]string) ([]*mysql.Result, error) {
 	pcslen := len(pcs)
@@ -492,29 +482,27 @@ func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs
 
 	rs := make([]interface{}, resultCount)
 
-	//get ContextWithTimeOut and CancelFunc
-	ctx := reqCtx.Get("ctx").(context.Context)
-	cancel := reqCtx.Get("cancel").(context.CancelFunc)
-	defer cancel()
+	maxSqlExecuteTime := se.manager.GetNamespace(se.namespace).maxSqlExecuteTime
+	var ctx context.Context
+	if maxSqlExecuteTime <= 0 {
+		ctx = context.Background()
+	} else {
+		ctx, _ = context.WithTimeout(context.Background(), time.Duration(maxSqlExecuteTime)*time.Millisecond)
+	}
 
 	// Control goroutinue execution
 	done := make(chan int64, pcslen)
 	defer close(done)
 
-	// key is connectionID,value Marks whether the connection successfully returned
-	pcsCompleted := make(map[int64]*pcInfo, pcslen)
-	for sliceName, pc := range pcs {
-		pcsCompleted[pc.GetConnectionID()] = &pcInfo{
-			sliceName: sliceName,
-			completed: false,
-			pc:        pc,
-		}
+	// This map is not thread safe.
+	pcsCompleted := make(map[int64]backend.PooledConnect, pcslen)
+	for _, pc := range pcs {
+		pcsCompleted[pc.GetConnectionID()] = pc
 	}
 
 	f := func(reqCtx *util.RequestContext, rs []interface{}, i int, execSqls map[string][]string, pc backend.PooledConnect) {
 		defer func() {
 			done <- pc.GetConnectionID()
-			fmt.Println("id:", pc.GetConnectionID())
 		}()
 		for db, sqls := range execSqls {
 			err := initBackendConn(pc, db, se.GetCharset(), se.GetCollationID(), se.GetVariables())
@@ -527,7 +515,6 @@ func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs
 				r, err := pc.Execute(v)
 				se.manager.RecordBackendSQLMetrics(reqCtx, se.namespace, v, pc.GetAddr(), startTime, err)
 				if err != nil {
-					fmt.Println("exec err:", err.Error())
 					rs[i] = err
 				} else {
 					rs[i] = r
@@ -547,22 +534,17 @@ func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs
 	}
 
 	sliceDone := 0
-loop:
-	for {
+	for i := 0; i < pcslen; i++ {
 		select {
 		case connectionID := <-done:
 			sliceDone++
-			pcsCompleted[connectionID].setCompleted(true)
-			if sliceDone == pcslen {
-				break loop
-			}
+			delete(pcsCompleted, connectionID)
 		case <-ctx.Done():
 			se.killConnection(pcsCompleted)
-			for i := 0; i < pcslen-sliceDone; i++ {
-				t := <-done
-				fmt.Println(t)
+			for j := 0; j < pcslen-sliceDone; j++ {
+				<-done
 			}
-			return nil, fmt.Errorf("sql exec out of time")
+			return nil, fmt.Errorf("sql exec out of maxSqlExecuteTime:%d Millisecond", maxSqlExecuteTime)
 		}
 	}
 
@@ -581,19 +563,17 @@ loop:
 	return r, err
 }
 
-func (se *SessionExecutor) killConnection(pcsCompleted map[int64]*pcInfo) {
-	for connID, pcInfo := range pcsCompleted {
-		if !pcInfo.completed {
-			killPc, err := pcsCompleted[connID].pc.GetPool().Get(context.TODO())
-			if err != nil {
-				log.Warn("get kill connection err:", err.Error())
-				continue
-			}
-			defer se.recycleBackendConn(killPc, false)
-			_, err = killPc.Execute(fmt.Sprintf("kill %d", connID))
-			if err != nil {
-				log.Warn("SessionExecutor.killConnection error,failed to kill connID %v: %v", connID, err)
-			}
+func (se *SessionExecutor) killConnection(pcsCompleted map[int64]backend.PooledConnect) {
+	for connID, pc := range pcsCompleted {
+		killPc, err := pc.GetPool().Get(context.TODO())
+		if err != nil {
+			log.Warn("get kill connection err:", err.Error())
+			continue
+		}
+		defer se.recycleBackendConn(killPc, false)
+		_, err = killPc.Execute(fmt.Sprintf("kill %d", connID))
+		if err != nil {
+			log.Warn("SessionExecutor.killConnection error,failed to kill connID %v: %v", connID, err)
 		}
 	}
 	return
