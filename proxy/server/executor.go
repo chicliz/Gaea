@@ -395,14 +395,46 @@ func (se *SessionExecutor) getTransactionConn(sliceName string) (pc backend.Pool
 
 func (se *SessionExecutor) executeInSlice(reqCtx *util.RequestContext, pc backend.PooledConnect, sql string) ([]*mysql.Result, error) {
 	startTime := time.Now()
-	r, err := pc.Execute(sql)
-	se.manager.RecordBackendSQLMetrics(reqCtx, se.namespace, sql, pc.GetAddr(), startTime, err)
 
-	if err != nil {
-		return nil, err
+	maxSqlExecuteTime := se.manager.GetNamespace(se.namespace).maxSqlExecuteTime
+	var ctx context.Context
+	if maxSqlExecuteTime <= 0 {
+		ctx = context.Background()
+	} else {
+		ctx, _ = context.WithTimeout(context.Background(), time.Duration(maxSqlExecuteTime)*time.Millisecond)
 	}
 
-	return []*mysql.Result{r}, err
+	done := make(chan struct{})
+
+	var r *mysql.Result
+	var executeErr error
+	go func(reqCtx *util.RequestContext, pc backend.PooledConnect, sql string, ctx context.Context) {
+		defer close(done)
+		r, executeErr = pc.Execute(sql)
+		se.manager.RecordBackendSQLMetrics(reqCtx, se.namespace, sql, pc.GetAddr(), startTime, executeErr)
+	}(reqCtx, pc, sql, ctx)
+
+	select {
+	case <-done:
+		fmt.Println("executeErr2:", executeErr)
+		return []*mysql.Result{r}, executeErr
+	case <-ctx.Done():
+		// If both are done already, we may end up here anyway because select
+		// chooses among multiple ready channels pseudorandomly.
+		// Check the done channel and prefer that one if it's ready.
+		select {
+		case <-done:
+			fmt.Println("executeErr2:", executeErr)
+			return []*mysql.Result{r}, executeErr
+		default:
+		}
+		// The context expired
+		// Try to kill the connection to effectively cancel the Execute.
+		se.killConnection(pc)
+		// Wait for the pc.Execute call to return.
+		<-done
+		return nil, fmt.Errorf("sql exec out of maxSqlExecuteTime:%d Millisecond", maxSqlExecuteTime)
+	}
 }
 
 func (se *SessionExecutor) recycleBackendConn(pc backend.PooledConnect, rollback bool) {
@@ -540,7 +572,7 @@ func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs
 			sliceDone++
 			delete(pcsCompleted, connectionID)
 		case <-ctx.Done():
-			se.killConnection(pcsCompleted)
+			se.killConnections(pcsCompleted)
 			for j := 0; j < pcslen-sliceDone; j++ {
 				<-done
 			}
@@ -563,7 +595,24 @@ func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs
 	return r, err
 }
 
-func (se *SessionExecutor) killConnection(pcsCompleted map[int64]backend.PooledConnect) {
+func (se *SessionExecutor) killConnection(pc backend.PooledConnect) {
+	connID := pc.GetConnectionID()
+	killPc, err := pc.GetPool().Get(context.TODO())
+	fmt.Println("connID:", connID)
+	fmt.Println("killPc connID:", killPc.GetConnectionID())
+	if err != nil {
+		log.Warn("get kill connection err:", err.Error())
+		return
+	}
+	defer se.recycleBackendConn(killPc, false)
+	_, err = killPc.Execute(fmt.Sprintf("kill %d", connID))
+	if err != nil {
+		log.Warn("SessionExecutor.killConnection error,failed to kill connID %v: %v", connID, err)
+	}
+	return
+}
+
+func (se *SessionExecutor) killConnections(pcsCompleted map[int64]backend.PooledConnect) {
 	for connID, pc := range pcsCompleted {
 		killPc, err := pc.GetPool().Get(context.TODO())
 		if err != nil {
