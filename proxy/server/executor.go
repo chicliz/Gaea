@@ -416,7 +416,6 @@ func (se *SessionExecutor) executeInSlice(reqCtx *util.RequestContext, pc backen
 
 	select {
 	case <-done:
-		fmt.Println("executeErr2:", executeErr)
 		return []*mysql.Result{r}, executeErr
 	case <-ctx.Done():
 		// If both are done already, we may end up here anyway because select
@@ -424,7 +423,6 @@ func (se *SessionExecutor) executeInSlice(reqCtx *util.RequestContext, pc backen
 		// Check the done channel and prefer that one if it's ready.
 		select {
 		case <-done:
-			fmt.Println("executeErr2:", executeErr)
 			return []*mysql.Result{r}, executeErr
 		default:
 		}
@@ -598,8 +596,6 @@ func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs
 func (se *SessionExecutor) killConnection(pc backend.PooledConnect) {
 	connID := pc.GetConnectionID()
 	killPc, err := pc.GetPool().Get(context.TODO())
-	fmt.Println("connID:", connID)
-	fmt.Println("killPc connID:", killPc.GetConnectionID())
 	if err != nil {
 		log.Warn("get kill connection err:", err.Error())
 		return
