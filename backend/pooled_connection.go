@@ -45,7 +45,7 @@ func (pc *pooledConnectImpl) Reconnect() error {
 	return nil
 }
 
-func (pc *pooledConnectImpl) GetPool() *connectionPoolImpl {
+func (pc *pooledConnectImpl) GetPool() ConnectionPool {
 	return pc.pool
 }
 

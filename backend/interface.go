@@ -24,7 +24,7 @@ type PooledConnect interface {
 	SetSessionVariables(frontend *mysql.SessionVariables) (bool, error)
 	WriteSetStatement() error
 	GetConnectionID() int64
-	GetPool() *connectionPoolImpl
+	GetPool() ConnectionPool
 }
 
 type ConnectionPool interface {
