@@ -405,27 +405,20 @@ func (se *SessionExecutor) executeInSlice(reqCtx *util.RequestContext, pc backen
 	}
 
 	done := make(chan struct{})
+	defer close(done)
 
 	var r *mysql.Result
 	var executeErr error
 	go func(reqCtx *util.RequestContext, pc backend.PooledConnect, sql string, ctx context.Context) {
-		defer close(done)
 		r, executeErr = pc.Execute(sql)
 		se.manager.RecordBackendSQLMetrics(reqCtx, se.namespace, sql, pc.GetAddr(), startTime, executeErr)
+		done <- struct{}{}
 	}(reqCtx, pc, sql, ctx)
 
 	select {
 	case <-done:
 		return []*mysql.Result{r}, executeErr
 	case <-ctx.Done():
-		// If both are done already, we may end up here anyway because select
-		// chooses among multiple ready channels pseudorandomly.
-		// Check the done channel and prefer that one if it's ready.
-		select {
-		case <-done:
-			return []*mysql.Result{r}, executeErr
-		default:
-		}
 		// The context expired
 		// Try to kill the connection to effectively cancel the Execute.
 		se.killConnection(pc)
@@ -498,7 +491,6 @@ func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs
 		log.Warn("Session executeInMultiSlices error, conns: %v, sqls: %v, error: %s", pcs, sqls, errors.ErrConnNotEqual.Error())
 		return nil, errors.ErrConnNotEqual
 	}
-
 	if pcslen == 0 {
 		return nil, errors.ErrNoPlan
 	}
