@@ -689,27 +689,22 @@ func (dc *DirectConnection) readResultRows(result *mysql.Result, isBinary bool, 
 
 // drainResults will read all packets for a result set and ignore them.
 func (dc *DirectConnection) drainResults() error {
-
-	// read one packet
-	readOnePacket := func(conn *mysql.Conn) error {
-		data, err := conn.ReadEphemeralPacket()
-		defer conn.RecycleReadPacket()
+	for {
+		data, err := dc.conn.ReadEphemeralPacket()
 		if err != nil {
+			dc.conn.RecycleReadPacket()
 			return err
 		}
 
 		if dc.isEOFPacket(data) {
+			dc.conn.RecycleReadPacket()
 			return nil
 		} else if data[0] == mysql.ErrHeader {
-			return dc.handleErrorPacket(data)
-		}
-		return nil
-	}
-
-	for {
-		if err := readOnePacket(dc.conn); err != nil {
+			err := dc.handleErrorPacket(data)
+			dc.conn.RecycleReadPacket()
 			return err
 		}
+		dc.conn.RecycleReadPacket()
 	}
 }
 
