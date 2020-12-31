@@ -206,7 +206,6 @@ func (c *Conn) ReadEphemeralPacket() ([]byte, error) {
 	}
 
 	r := c.getReader()
-
 	length, err := c.readHeaderFrom(r)
 	if err != nil {
 		return nil, err
@@ -223,6 +222,7 @@ func (c *Conn) ReadEphemeralPacket() ([]byte, error) {
 	if length < MaxPacketSize {
 		c.currentEphemeralBuffer = bufPool.Get(length)
 		if _, err := io.ReadFull(r, *c.currentEphemeralBuffer); err != nil {
+			c.RecycleReadPacket()
 			return nil, fmt.Errorf("io.ReadFull(packet body of length %v) failed: %v", length, err)
 		}
 		return *c.currentEphemeralBuffer, nil
@@ -264,7 +264,6 @@ func (c *Conn) ReadEphemeralPacketDirect() ([]byte, error) {
 	if c.currentEphemeralPolicy != ephemeralUnused {
 		panic(fmt.Errorf("ReadEphemeralPacketDirect: unexpected currentEphemeralPolicy: %v", c.currentEphemeralPolicy))
 	}
-	c.currentEphemeralPolicy = ephemeralRead
 
 	var r io.Reader = c.conn
 	length, err := c.readHeaderFrom(r)
@@ -272,6 +271,7 @@ func (c *Conn) ReadEphemeralPacketDirect() ([]byte, error) {
 		return nil, err
 	}
 
+	c.currentEphemeralPolicy = ephemeralRead
 	if length == 0 {
 		// This can be caused by the packet after a packet of
 		// exactly size MaxPacketSize.
@@ -281,6 +281,7 @@ func (c *Conn) ReadEphemeralPacketDirect() ([]byte, error) {
 	if length < MaxPacketSize {
 		c.currentEphemeralBuffer = bufPool.Get(length)
 		if _, err := io.ReadFull(r, *c.currentEphemeralBuffer); err != nil {
+			c.RecycleReadPacket()
 			return nil, fmt.Errorf("io.ReadFull(packet body of length %v) failed: %v", length, err)
 		}
 		return *c.currentEphemeralBuffer, nil
