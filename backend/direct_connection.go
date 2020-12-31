@@ -692,6 +692,7 @@ func (dc *DirectConnection) drainResults() error {
 	for {
 		data, err := dc.conn.ReadEphemeralPacket()
 		if err != nil {
+			dc.conn.RecycleReadPacket()
 			return err
 		}
 

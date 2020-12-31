@@ -131,10 +131,11 @@ func (cc *ClientConn) readHandshakeResponse() (HandshakeResponseInfo, error) {
 	info.Salt = cc.salt
 
 	data, err := cc.ReadEphemeralPacketDirect()
+	defer cc.RecycleReadPacket()
 	if err != nil {
 		return info, err
 	}
-	defer cc.RecycleReadPacket()
+
 	pos := 0
 
 	// Client flags, 4 bytes.
