@@ -690,7 +690,7 @@ func (dc *DirectConnection) readResultRows(result *mysql.Result, isBinary bool, 
 // drainResults will read all packets for a result set and ignore them.
 func (dc *DirectConnection) drainResults() error {
 
-	// read one packet,
+	// read one packet
 	readOnePacket := func(conn *mysql.Conn) error {
 		data, err := conn.ReadEphemeralPacket()
 		defer conn.RecycleReadPacket()
